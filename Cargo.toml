@@ -1,0 +1,21 @@
+[package]
+name = "fst-merger"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.23", features = ["derive"] }
+fstapi = "0.0.2"
+indicatif = "0.17.9"
+# wellen = "0.13.6"
+wellen = { path = "../wellen/wellen" }
+
+[patch.crates-io]
+fst-reader = { path = "../fst-reader" }
+
+[profile.release]
+debug = true
+
+[profile.samply]
+inherits = "release"
+debug = true
