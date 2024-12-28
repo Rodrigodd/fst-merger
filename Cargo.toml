@@ -5,10 +5,9 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.5.23", features = ["derive"] }
+fst-reader = "0.10.0"
 fstapi = "0.0.2"
 indicatif = "0.17.9"
-# wellen = "0.13.6"
-wellen = { path = "../wellen/wellen" }
 
 [patch.crates-io]
 fst-reader = { path = "../fst-reader" }

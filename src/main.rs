@@ -8,18 +8,13 @@
 // by the command name.
 
 use clap::Parser;
-use fstapi::{var_dir, var_type, Writer};
-use indicatif::ProgressIterator;
-use wellen::{
-    simple::{self, Waveform},
-    Hierarchy, HierarchyItem, Result, Scope, ScopeType, SignalEncoding, SignalRef, SignalValue,
-    TimeTableIdx, Var, VarDirection, VarType,
-};
+use fst_reader::{FstReader, FstSignalHandle, FstSignalValue};
+use fstapi::Writer;
+use std::io::{BufRead, Seek};
+use std::sync::mpsc::{channel, Receiver};
 
 #[derive(Parser, Debug)]
-#[command(name = "2fst")]
-#[command(author = "Kevin Laeufer <laeufer@cornell.edu>")]
-#[command(version)]
+#[command(name = "fst-merge")]
 #[command(about = "Converts a VCD, GHW or FST file to an FST file.", long_about = None)]
 struct Args {
     #[arg(value_name = "INPUTs")]
@@ -36,25 +31,24 @@ fn main() {
     let args = Args::parse();
 
     // let mut wave = simple::read(args.input).expect("failed to read input");
-    let mut waves: Vec<Waveform> = args
+    let mut waves: Vec<FstReader<_>> = args
         .inputs
         .iter()
-        .map(simple::read)
-        .map(Result::unwrap)
+        .map(|path| {
+            let file = std::fs::File::open(path).expect("failed to open file");
+            FstReader::open_and_read_time_table(std::io::BufReader::new(file))
+                .expect("failed to open FST")
+        })
         .collect();
 
     let timescales = waves.iter().map(|wave| {
-        let timescale = wave.hierarchy().timescale().unwrap_or(wellen::Timescale {
-            factor: 1,
-            unit: wellen::TimescaleUnit::Unknown,
-        });
-        let mut timescale_exponent = timescale.unit.to_exponent().unwrap_or(0);
-        let mut factor = timescale.factor;
+        let factor = 1;
+        let timescale_exponent = wave.get_header().timescale_exponent;
 
-        while factor % 10 == 0 {
-            factor /= 10;
-            timescale_exponent += 1;
-        }
+        // while factor % 10 == 0 {
+        //     factor /= 10;
+        //     timescale_exponent += 1;
+        // }
 
         (factor, timescale_exponent)
     });
@@ -97,42 +91,55 @@ fn main() {
     let mut out = Writer::create(args.output, true)
         .expect("failed to open output")
         .timescale(timescale_exponent as i32);
-    let signal_ref_maps = write_hierarchy(waves.iter().map(|wave| wave.hierarchy()), &mut out);
-
-    // load all signals into memory
-    println!("Loading signals");
-    for (wave, signal_ref_map) in waves.iter_mut().zip(signal_ref_maps.iter()).progress() {
-        let all_signals: Vec<_> = signal_ref_map.keys().cloned().collect();
-        wave.load_signals_multi_threaded(&all_signals);
-    }
+    let signal_ref_maps = write_hierarchy(waves.iter_mut(), &mut out);
 
     let waves: Vec<_> = waves
         .into_iter()
-        .zip(signal_ref_maps.iter())
+        .zip(signal_ref_maps)
         .zip(factors)
-        .map(|((wave, signal_ref_map), factor)| {
-            // sort signal ids in order to get a deterministic output
-            let mut signal_ids: Vec<_> = signal_ref_map.iter().map(|(a, b)| (*a, *b)).collect();
-            signal_ids.sort_by_key(|(wellen_id, _)| *wellen_id);
-
-            wave.time_table();
-            wave.get_signal(signal_ids[0].0).unwrap().iter_changes();
-
-            (wave, factor, signal_ids)
-        })
+        .map(|((wave, signal_ref_map), factor)| (wave, factor, signal_ref_map))
         .collect();
-    write_value_changes(waves.as_slice(), &mut out);
+    write_value_changes(waves, &mut out);
 
     println!("Finishing writing FST file");
     // out.finish().expect("failed to finish writing the FST file");
+}
+
+fn reader_to_channel<R: BufRead + Seek + Send + 'static>(
+    mut reader: FstReader<R>,
+) -> Receiver<(u64, FstSignalHandle, Vec<u8>)> {
+    let mut ids = Vec::new();
+
+    reader
+        .read_hierarchy(|entry| {
+            if let fst_reader::FstHierarchyEntry::Var { handle, .. } = entry {
+                ids.push(handle)
+            }
+        })
+        .unwrap();
+
+    let filter = fst_reader::FstFilter::new(0, u64::MAX, ids);
+
+    let (sender, receiver) = channel();
+
+    std::thread::spawn(move || {
+        reader.read_signals(&filter, |time_idx, handle, value| match value {
+            FstSignalValue::String(value) => {
+                sender.send((time_idx, handle, value.to_vec())).unwrap();
+            }
+            FstSignalValue::Real(_) => unimplemented!(),
+        })
+    });
+
+    receiver
 }
 
 /// Writes all value changes from the source file to the FST.
 /// Note this is not the most efficient way to do this!
 /// A faster version would write each signal directly to the FST instead
 /// of writing changes based on the time step.
-fn write_value_changes(
-    waves: &[(Waveform, u32, Vec<(SignalRef, fstapi::Handle)>)],
+fn write_value_changes<R: BufRead + Seek + Send + 'static>(
+    waves: Vec<(FstReader<R>, u32, SignalRefMap)>,
     out: &mut Writer,
 ) {
     // PERF: use a n-way merge sort
@@ -141,7 +148,8 @@ fn write_value_changes(
         .iter()
         .enumerate()
         .flat_map(|(idx, (wave, factor, _))| {
-            wave.time_table()
+            wave.get_time_table()
+                .unwrap()
                 .iter()
                 .enumerate()
                 .map(move |(time_idx, time)| (*time * *factor as u64, idx, time_idx))
@@ -150,21 +158,8 @@ fn write_value_changes(
     time_table.sort_unstable();
 
     let mut signals: Vec<_> = waves
-        .iter()
-        .map(|(wave, _, signal_ids)| {
-            signal_ids
-                .iter()
-                .map(move |(wellen_ref, fst_id)| {
-                    (
-                        fst_id,
-                        wave.get_signal(*wellen_ref)
-                            .unwrap()
-                            .iter_changes()
-                            .peekable(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
+        .into_iter()
+        .map(|(wave, _, signal_ids)| (reader_to_channel(wave).into_iter().peekable(), signal_ids))
         .collect();
 
     println!("Writing value changes");
@@ -176,42 +171,38 @@ fn write_value_changes(
 
     let bar = indicatif::ProgressBar::new(time_table.len() as u64).with_style(style);
 
+    bar.set_position(0);
+
     for (i, (time, wave_idx, time_idx)) in time_table.iter().enumerate() {
         out.emit_time_change(*time).expect("failed time change");
 
-        let time_idx = *time_idx as TimeTableIdx;
-        for (fst_id, signal_iter) in &mut signals[*wave_idx] {
-            while signal_iter
-                .peek()
-                .map(|(change_idx, _)| *change_idx == time_idx)
-                .unwrap_or(false)
-            {
-                let (_, value) = signal_iter.next().unwrap();
-                if let Some(bit_str) = value.to_bit_string() {
-                    out.emit_value_change(**fst_id, bit_str.as_bytes())
-                        .expect("failed to write value change");
+        let time_idx = *time_idx as u64;
+        let (signal_iter, signal_ref_map) = &mut signals[*wave_idx];
+        while signal_iter
+            .peek()
+            .map(|(change_idx, _, _)| *change_idx == time_idx)
+            .unwrap_or(false)
+        {
+            let (_, fst_id, value) = signal_iter.next().unwrap();
 
-                    if i % 1_000_000 == 0 {
-                        bar.set_position(i as u64);
-                    }
-                    if i % 10_000_000 == 0 {
-                        out.flush();
-                    }
-                } else if let SignalValue::Real(value) = value {
-                    todo!("deal with real value: {value}");
-                } else {
-                    todo!("deal with var len string");
-                }
+            out.emit_value_change(*signal_ref_map.get(&fst_id.get_index()).unwrap(), &value)
+                .expect("failed to write value change");
+
+            if i % 1_000_000 == 0 {
+                bar.set_position(i as u64);
+            }
+            if i % 10_000_000 == 0 {
+                out.flush();
             }
         }
     }
     bar.finish();
 }
 
-type SignalRefMap = std::collections::HashMap<SignalRef, fstapi::Handle>;
+type SignalRefMap = std::collections::HashMap<usize, fstapi::Handle>;
 
-fn write_hierarchy<'a>(
-    hiers: impl Iterator<Item = &'a Hierarchy>,
+fn write_hierarchy<'a, R: BufRead + Seek + 'a>(
+    hiers: impl Iterator<Item = &'a mut FstReader<R>>,
     out: &mut Writer,
 ) -> Vec<SignalRefMap> {
     println!("Writing hierarchy");
@@ -220,125 +211,38 @@ fn write_hierarchy<'a>(
         out.set_scope(fstapi::scope_type::VCD_MODULE, &i.to_string(), "")
             .expect("failed to write top scope");
         let mut signal_ref_map = SignalRefMap::new();
-        for item in hier.items() {
-            match item {
-                HierarchyItem::Scope(scope) => write_scope(hier, out, &mut signal_ref_map, scope),
-                HierarchyItem::Var(var) => write_var(hier, out, &mut signal_ref_map, var),
+
+        hier.read_hierarchy(|entry| match entry {
+            fst_reader::FstHierarchyEntry::Scope {
+                tpe,
+                name,
+                component,
+            } => out.set_scope(tpe as u32, &name, &component).unwrap(),
+            fst_reader::FstHierarchyEntry::UpScope => out.set_upscope(),
+            fst_reader::FstHierarchyEntry::Var {
+                tpe,
+                direction,
+                name,
+                length,
+                handle,
+                is_alias: _,
+            } => {
+                let alias = signal_ref_map.get(&handle.get_index()).cloned();
+                let handle2 = out
+                    .create_var(tpe as u32, direction as u32, length, &name, alias)
+                    .unwrap();
+                if alias.is_none() {
+                    signal_ref_map.insert(handle.get_index(), handle2);
+                }
             }
-        }
+            x => unimplemented!("{:?}", x),
+        })
+        .unwrap();
+
         signal_ref_maps.push(signal_ref_map);
         out.set_upscope();
     }
     signal_ref_maps
-}
-
-fn write_scope(
-    hier: &Hierarchy,
-    out: &mut Writer,
-    signal_ref_map: &mut SignalRefMap,
-    scope: &Scope,
-) {
-    let name = scope.name(hier);
-    let component = scope.component(hier).unwrap_or("");
-    let tpe = match scope.scope_type() {
-        ScopeType::Module => fstapi::scope_type::VCD_MODULE,
-        ScopeType::Task => todo!(),
-        ScopeType::Function => todo!(),
-        ScopeType::Begin => todo!(),
-        ScopeType::Fork => todo!(),
-        ScopeType::Generate => todo!(),
-        ScopeType::Struct => todo!(),
-        ScopeType::Union => todo!(),
-        ScopeType::Class => todo!(),
-        ScopeType::Interface => todo!(),
-        ScopeType::Package => todo!(),
-        ScopeType::Program => todo!(),
-        ScopeType::VhdlArchitecture => todo!(),
-        ScopeType::VhdlProcedure => todo!(),
-        ScopeType::VhdlFunction => todo!(),
-        ScopeType::VhdlRecord => todo!(),
-        ScopeType::VhdlProcess => todo!(),
-        ScopeType::VhdlBlock => todo!(),
-        ScopeType::VhdlForGenerate => todo!(),
-        ScopeType::VhdlIfGenerate => todo!(),
-        ScopeType::VhdlGenerate => todo!(),
-        ScopeType::VhdlPackage => todo!(),
-        ScopeType::GhwGeneric => todo!(),
-        ScopeType::VhdlArray => todo!(),
-    };
-    out.set_scope(tpe, name, component)
-        .expect("failed to write scope");
-
-    for item in scope.items(hier) {
-        match item {
-            HierarchyItem::Scope(scope) => write_scope(hier, out, signal_ref_map, scope),
-            HierarchyItem::Var(var) => write_var(hier, out, signal_ref_map, var),
-        }
-    }
-    out.set_upscope();
-}
-
-fn write_var(hier: &Hierarchy, out: &mut Writer, signal_ref_map: &mut SignalRefMap, var: &Var) {
-    let name = var.name(hier);
-    let length = match var.signal_encoding() {
-        SignalEncoding::String => todo!("support varlen!"),
-        SignalEncoding::Real => todo!("support real!"),
-        SignalEncoding::BitVector(len) => len,
-    };
-    let tpe = match var.var_type() {
-        VarType::Event => fstapi::var_type::VCD_EVENT,
-        VarType::Integer => fstapi::var_type::VCD_INTEGER,
-        VarType::Parameter => fstapi::var_type::VCD_PARAMETER,
-        VarType::Real => fstapi::var_type::VCD_REAL,
-        VarType::Reg => fstapi::var_type::VCD_REG,
-        VarType::Supply0 => fstapi::var_type::VCD_SUPPLY0,
-        VarType::Supply1 => fstapi::var_type::VCD_SUPPLY1,
-        VarType::Time => fstapi::var_type::VCD_TIME,
-        VarType::Tri => fstapi::var_type::VCD_TRI,
-        VarType::TriAnd => fstapi::var_type::VCD_TRIAND,
-        VarType::TriOr => fstapi::var_type::VCD_TRIOR,
-        VarType::TriReg => fstapi::var_type::VCD_TRIREG,
-        VarType::Tri0 => fstapi::var_type::VCD_TRI0,
-        VarType::Tri1 => fstapi::var_type::VCD_TRI1,
-        VarType::WAnd => fstapi::var_type::VCD_WAND,
-        VarType::Wire => fstapi::var_type::VCD_WIRE,
-        VarType::WOr => fstapi::var_type::VCD_WOR,
-        VarType::String => fstapi::var_type::GEN_STRING,
-        VarType::Port => fstapi::var_type::VCD_PORT,
-        VarType::SparseArray => fstapi::var_type::VCD_SPARRAY,
-        VarType::RealTime => fstapi::var_type::VCD_REALTIME,
-        VarType::Bit => fstapi::var_type::SV_BIT,
-        VarType::Logic => fstapi::var_type::SV_LOGIC,
-        VarType::Int => fstapi::var_type::SV_INT,
-        VarType::ShortInt => fstapi::var_type::SV_SHORTINT,
-        VarType::LongInt => fstapi::var_type::SV_LONGINT,
-        VarType::Byte => fstapi::var_type::SV_BYTE,
-        VarType::Enum => fstapi::var_type::SV_ENUM,
-        VarType::ShortReal => fstapi::var_type::SV_SHORTREAL,
-        VarType::Boolean => todo!(),
-        VarType::BitVector => todo!(),
-        VarType::StdLogic => todo!(),
-        VarType::StdLogicVector => todo!(),
-        VarType::StdULogic => todo!(),
-        VarType::StdULogicVector => todo!(),
-    };
-    let dir = match var.direction() {
-        VarDirection::Unknown => 0,
-        VarDirection::Implicit => fstapi::var_dir::IMPLICIT,
-        VarDirection::Input => fstapi::var_dir::INPUT,
-        VarDirection::Output => fstapi::var_dir::OUTPUT,
-        VarDirection::InOut => fstapi::var_dir::INOUT,
-        VarDirection::Buffer => fstapi::var_dir::BUFFER,
-        VarDirection::Linkage => fstapi::var_dir::LINKAGE,
-    };
-
-    let alias = signal_ref_map.get(&var.signal_ref()).cloned();
-    let fst_signal_id = out
-        .create_var(tpe, dir, length.get(), name, alias)
-        .expect("failed to write variable");
-    if alias.is_none() {
-        signal_ref_map.insert(var.signal_ref(), fst_signal_id);
-    }
 }
 
 /// Lowest common multiple
