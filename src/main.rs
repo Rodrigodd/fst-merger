@@ -10,8 +10,12 @@
 use clap::Parser;
 use fst_reader::{FstReader, FstSignalHandle, FstSignalValue};
 use fstapi::Writer;
-use std::io::{BufRead, Seek};
-use std::sync::mpsc::{channel, Receiver};
+use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
+use std::{
+    collections::HashMap,
+    io::{BufRead, Read, Seek},
+    sync::Arc,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "fst-merge")]
@@ -21,6 +25,9 @@ struct Args {
     inputs: Vec<std::path::PathBuf>,
     #[arg(short, long)]
     output: std::path::PathBuf,
+
+    #[arg(short, long)]
+    cmp: Option<String>,
 }
 
 const PROGRESS_BAR_TEMPLATE: &str = "\
@@ -105,33 +112,154 @@ fn main() {
     // out.finish().expect("failed to finish writing the FST file");
 }
 
-fn reader_to_channel<R: BufRead + Seek + Send + 'static>(
-    mut reader: FstReader<R>,
-) -> Receiver<(u64, FstSignalHandle, Vec<u8>)> {
-    let mut ids = Vec::new();
+struct SignalChannel {
+    queue: [Arc<Mutex<Vec<u8>>>; Self::LEN],
+    front_lock: ArcMutexGuard<RawMutex, Vec<u8>>,
+    read: usize,
+}
 
-    reader
-        .read_hierarchy(|entry| {
-            if let fst_reader::FstHierarchyEntry::Var { handle, .. } = entry {
-                ids.push(handle)
+impl SignalChannel {
+    const LEN: usize = 3;
+
+    fn new<R: BufRead + Seek + Send + 'static>(mut reader: FstReader<R>) -> Self {
+        let mut ids = Vec::new();
+
+        reader
+            .read_hierarchy(|entry| {
+                if let fst_reader::FstHierarchyEntry::Var { handle, .. } = entry {
+                    ids.push(handle)
+                }
+            })
+            .unwrap();
+
+        let filter = fst_reader::FstFilter::new(0, u64::MAX, ids);
+
+        let queue = std::array::from_fn(|_| Arc::new(Mutex::new(Vec::new())));
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        std::thread::spawn({
+            let mut queue: [_; Self::LEN] = std::array::from_fn(|i| queue[i].clone());
+            let barrier = barrier.clone();
+            move || {
+                const KB: usize = 1024;
+                const MB: usize = 1024 * KB;
+                const BUFFER_SIZE: usize = 8 * MB;
+
+                let mut lock: ArcMutexGuard<RawMutex, Vec<u8>> = queue[0].lock_arc();
+
+                barrier.wait();
+
+                let mut last_time = 0;
+
+                reader
+                    .read_signals(&filter, move |time, handle, value| match value {
+                        FstSignalValue::String(value) => {
+                            // assert!(
+                            //     time >= last_time,
+                            //     "time: {} < last_time: {}",
+                            //     time,
+                            //     last_time
+                            // );
+                            if time < last_time {
+                                println!("time: {} < last_time: {}", time, last_time);
+                                return;
+                            }
+                            last_time = time;
+
+                            if lock.len() + value.len() > BUFFER_SIZE {
+                                // swap
+                                queue.rotate_left(1);
+                                drop(std::mem::replace(&mut lock, queue[0].lock_arc()));
+                                debug_assert!(lock.len() == 0);
+                            }
+
+                            push_to_buffer(&mut lock, time, handle, value);
+                        }
+                        FstSignalValue::Real(_) => unimplemented!(),
+                    })
+                    .unwrap();
             }
-        })
-        .unwrap();
+        });
 
-    let filter = fst_reader::FstFilter::new(0, u64::MAX, ids);
+        // wait for the reader to get the lock
+        barrier.wait();
 
-    let (sender, receiver) = channel();
+        let front_lock = queue[0].lock_arc();
+        SignalChannel {
+            queue,
+            front_lock,
+            read: 0,
+        }
+    }
 
-    std::thread::spawn(move || {
-        reader.read_signals(&filter, |time_idx, handle, value| match value {
-            FstSignalValue::String(value) => {
-                sender.send((time_idx, handle, value.to_vec())).unwrap();
+    fn next_inner(&mut self, consume: bool) -> Option<(u64, FstSignalHandle, &[u8])> {
+        loop {
+            let start = &self.front_lock[self.read..];
+            let after = &mut &start[..];
+            if let Some((time_idx, handle, value)) = read_from_buffer(after) {
+                if consume {
+                    self.read += start.len() - after.len();
+                }
+                // workaround for borrow checker limitation
+                let value = unsafe { std::mem::transmute::<&[u8], &[u8]>(value) };
+                return Some((time_idx, handle, value));
             }
-            FstSignalValue::Real(_) => unimplemented!(),
-        })
-    });
 
-    receiver
+            // swap buffers
+            self.front_lock.clear();
+            self.queue.rotate_left(1);
+            drop(std::mem::replace(
+                &mut self.front_lock,
+                self.queue[0].lock_arc(),
+            ));
+            self.read = 0;
+
+            if self.front_lock.is_empty() {
+                println!("Finished reading");
+                return None;
+            }
+        }
+    }
+
+    fn next(&mut self) -> Option<(u64, FstSignalHandle, &[u8])> {
+        self.next_inner(true)
+    }
+
+    fn peek(&mut self) -> Option<(u64, FstSignalHandle, &[u8])> {
+        self.next_inner(false)
+    }
+}
+
+fn push_to_buffer(buffer: &mut Vec<u8>, time_idx: u64, handle: FstSignalHandle, value: &[u8]) {
+    buffer.extend_from_slice(&time_idx.to_ne_bytes());
+    buffer.extend_from_slice(&handle.get_index().to_ne_bytes());
+    buffer.extend_from_slice(&(value.len() as u16).to_ne_bytes());
+    buffer.extend_from_slice(value);
+}
+
+fn read_from_buffer<'a>(buffer: &mut &'a [u8]) -> Option<(u64, FstSignalHandle, &'a [u8])> {
+    if buffer.is_empty() {
+        return None;
+    }
+    // if it is not empty, it is a logic error if the buffer is too short
+
+    let mut time_idx = [0; u64::BITS as usize / 8];
+    buffer.read_exact(&mut time_idx).unwrap();
+    let time_idx = u64::from_ne_bytes(time_idx);
+
+    let mut handle = [0; usize::BITS as usize / 8];
+    buffer.read_exact(&mut handle).unwrap();
+    let handle = FstSignalHandle::from_index(usize::from_ne_bytes(handle));
+
+    let mut len = [0; u16::BITS as usize / 8];
+    buffer.read_exact(&mut len).unwrap();
+    let len = u16::from_ne_bytes(len);
+
+    let value = &buffer[..len as usize];
+    *buffer = &buffer[len as usize..];
+
+    Some((time_idx, handle, value))
 }
 
 /// Writes all value changes from the source file to the FST.
@@ -143,7 +271,7 @@ fn write_value_changes<R: BufRead + Seek + Send + 'static>(
     out: &mut Writer,
 ) {
     // PERF: use a n-way merge sort
-    // println!("Sorting time table");
+    println!("Sorting time table");
     let mut time_table = waves
         .iter()
         .enumerate()
@@ -159,7 +287,7 @@ fn write_value_changes<R: BufRead + Seek + Send + 'static>(
 
     let mut signals: Vec<_> = waves
         .into_iter()
-        .map(|(wave, _, signal_ids)| (reader_to_channel(wave).into_iter().peekable(), signal_ids))
+        .map(|(wave, _, signal_ids)| (SignalChannel::new(wave), signal_ids))
         .collect();
 
     println!("Writing value changes");
@@ -174,26 +302,34 @@ fn write_value_changes<R: BufRead + Seek + Send + 'static>(
     bar.set_position(0);
 
     for (i, (time, wave_idx, time_idx)) in time_table.iter().enumerate() {
+        // println!("Time: {} {} {}", time_idx, time, wave_idx);
         out.emit_time_change(*time).expect("failed time change");
 
-        let time_idx = *time_idx as u64;
         let (signal_iter, signal_ref_map) = &mut signals[*wave_idx];
         while signal_iter
             .peek()
-            .map(|(change_idx, _, _)| *change_idx == time_idx)
-            .unwrap_or(false)
+            .map(|(change_time, _, _)| {
+                assert!(
+                    change_time >= *time,
+                    "change_idx: {} < time: {}",
+                    change_time,
+                    time
+                );
+                change_time == *time
+            })
+            .unwrap_or_else(|| false)
         {
             let (_, fst_id, value) = signal_iter.next().unwrap();
 
-            out.emit_value_change(*signal_ref_map.get(&fst_id.get_index()).unwrap(), &value)
+            out.emit_value_change(*signal_ref_map.get(&fst_id.get_index()).unwrap(), value)
                 .expect("failed to write value change");
 
             if i % 1_000_000 == 0 {
                 bar.set_position(i as u64);
             }
-            if i % 10_000_000 == 0 {
-                out.flush();
-            }
+            // if i % 10_000_000 == 0 {
+            //     out.flush();
+            // }
         }
     }
     bar.finish();
