@@ -10,7 +10,7 @@
 use clap::Parser;
 use fst_reader::{FstReader, FstSignalHandle, FstSignalValue};
 use fstapi::Writer;
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
 use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
 use std::{
     io::{BufRead, Read, Seek},
@@ -71,6 +71,33 @@ fn main() {
 
     let args = Args::parse();
 
+    let offsets = args
+        .offsets
+        .as_ref()
+        .map(|offsets| offsets.split(',').map(parse_as_ns).collect::<Vec<_>>())
+        .unwrap_or_else(|| vec![0; args.inputs.len()]);
+
+    if offsets.len() != args.inputs.len() {
+        panic!("Number of offsets does not match number of input files");
+    }
+
+    let mut compares = Vec::new();
+    if let Some(cmp) = args.cmp.as_ref() {
+        for c in cmp.split(',') {
+            let (name, expr) = c.split_once(':').expect("invalid compare format");
+            let (left, right) = expr.split_once('=').expect("invalid compare format");
+            compares.push((name.trim(), left.trim(), right.trim()));
+        }
+    }
+
+    let range = args.range.as_ref().map(|range| {
+        let (start, end) = range.split_once('-').expect("invalid range format");
+        let start = parse_as_ns(start);
+        let end = parse_as_ns(end);
+        (start, end)
+    });
+    let mut input_range = (u64::MAX, 0);
+
     println!("{:>10.2?} Reading input files", start.elapsed());
 
     // let mut wave = simple::read(args.input).expect("failed to read input");
@@ -79,23 +106,37 @@ fn main() {
         .iter()
         .map(|path| {
             let file = std::fs::File::open(path).expect("failed to open file");
-            let reader = FstReader::open_and_read_time_table(std::io::BufReader::new(file))
-                .expect("failed to open FST");
+            let reader =
+                FstReader::open(std::io::BufReader::new(file)).expect("failed to open FST");
 
             let header = reader.get_header();
             let exp = header.timescale_exponent;
+
+            let start_ns = to_ns(header.start_time, exp);
+            let end_ns = to_ns(header.end_time, exp);
+
+            if start_ns < input_range.0 {
+                input_range.0 = start_ns;
+            }
+            if end_ns > input_range.1 {
+                input_range.1 = end_ns;
+            }
 
             println!(
                 "{:>10.2?} Input file {}: interval: {:.2?} to {:.2?}",
                 start.elapsed(),
                 path.display(),
-                std::time::Duration::from_nanos(to_ns(header.start_time, exp)),
-                std::time::Duration::from_nanos(to_ns(header.end_time, exp))
+                std::time::Duration::from_nanos(start_ns),
+                std::time::Duration::from_nanos(end_ns)
             );
 
             reader
         })
         .collect();
+
+    if let Some(range) = range.as_ref() {
+        input_range = *range;
+    }
 
     let timescales = waves.iter().map(|wave| {
         let factor = 1;
@@ -111,43 +152,12 @@ fn main() {
 
     let timescale_exponent = timescales.clone().map(|(_, exp)| exp).min().unwrap();
 
-    let range = args.range.as_ref().map(|range| {
-        let (start, end) = range.split_once('-').expect("invalid range format");
-        let start = parse_as_ns(start);
-        let end = parse_as_ns(end);
-        (start, end)
-    });
-
-    let offsets = args
-        .offsets
-        .as_ref()
-        .map(|offsets| {
-            offsets
-                .split(',')
-                .map(|offset| parse_as_ns(offset))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| vec![0; waves.len()]);
-
     let factors = timescales
         .map(|(factor, exp)| {
             let exp = exp - timescale_exponent;
             factor * 10u32.pow(exp as u32)
         })
         .collect::<Vec<_>>();
-
-    if offsets.len() != waves.len() {
-        panic!("Number of offsets does not match number of input files");
-    }
-
-    let mut compares = Vec::new();
-    if let Some(cmp) = args.cmp.as_ref() {
-        for c in cmp.split(',') {
-            let (name, expr) = c.split_once(':').expect("invalid compare format");
-            let (left, right) = expr.split_once('=').expect("invalid compare format");
-            compares.push((name.trim(), left.trim(), right.trim()));
-        }
-    }
 
     println!("{:>10.2?} Writing hierarchy", start.elapsed());
     let mut out = Writer::create(args.output, true)
@@ -179,7 +189,7 @@ fn main() {
         .zip(offsets)
         .map(|(((wave, signal_ref_map), factor), offset)| (wave, factor, offset, signal_ref_map))
         .collect();
-    write_value_changes(start, timescale_exponent, range, waves, &compares, &mut out);
+    write_value_changes(input_range, start, range, waves, &compares, &mut out);
 
     println!("{:>10.2?} Finished writing", start.elapsed());
     // out.finish().expect("failed to finish writing the FST file");
@@ -328,7 +338,35 @@ impl SignalChannel {
     fn peek(&mut self) -> Option<(u64, FstSignalHandle, &[u8])> {
         self.next_inner(false)
     }
+
+    fn cmp(&mut self, other: &mut Self) -> std::cmp::Ordering {
+        self.peek()
+            .map(|(a, _, _)| {
+                other
+                    .peek()
+                    .map(|(b, _, _)| a.partial_cmp(&b).unwrap())
+                    .unwrap_or(std::cmp::Ordering::Greater)
+            })
+            .unwrap_or_else(|| {
+                other
+                    .peek()
+                    .map(|_| std::cmp::Ordering::Less)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    }
 }
+// The ord implement compares to value of `peek`. This is used to allow merge-sorting multiple
+// SignalChannels.
+// impl std::cmp::PartialOrd for SignalChannel {
+//     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+//         self.peek().map(|(a, _, _)| {
+//             other
+//                 .peek()
+//                 .map(|(b, _, _)| a.partial_cmp(&b).unwrap())
+//                 .unwrap_or(std::cmp::Ordering::Less)
+//         })
+//     }
+// }
 
 fn push_to_buffer(buffer: &mut Vec<u8>, time: u64, handle: FstSignalHandle, value: &[u8]) {
     buffer.extend_from_slice(&time.to_ne_bytes());
@@ -361,58 +399,112 @@ fn read_from_buffer<'a>(buffer: &mut &'a [u8]) -> Option<(u64, FstSignalHandle, 
     Some((time, handle, value))
 }
 
+fn slice_get_two<T>(slice: &mut [T], a: usize, b: usize) -> (&mut T, &mut T) {
+    assert!(a < b);
+    assert!(b < slice.len());
+    let (left, right) = slice.split_at_mut(b);
+    (&mut left[a], &mut right[0])
+}
+
+struct BinaryHeap<T, F> {
+    data: Vec<T>,
+    comparator: F,
+}
+impl<T, F: Fn(&mut T, &mut T) -> std::cmp::Ordering> BinaryHeap<T, F> {
+    fn new(comparator: F) -> Self {
+        BinaryHeap {
+            data: Vec::new(),
+            comparator,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    fn insert(&mut self, value: T) {
+        self.data.push(value);
+        self.sift_up(self.data.len() - 1);
+    }
+
+    fn peek(&mut self) -> Option<&mut T> {
+        self.data.first_mut()
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        if self.data.is_empty() {
+            return None;
+        }
+        let last = self.data.pop().unwrap();
+        if !self.data.is_empty() {
+            let first = std::mem::replace(&mut self.data[0], last);
+            self.sift_down(0);
+            Some(first)
+        } else {
+            Some(last)
+        }
+    }
+
+    fn sift_up(&mut self, mut idx: usize) {
+        while idx > 0 {
+            let parent_idx = (idx - 1) / 2;
+            let (parent, child) = slice_get_two(&mut self.data, parent_idx, idx);
+            if (self.comparator)(parent, child).is_gt() {
+                self.data.swap(parent_idx, idx);
+                idx = parent_idx;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn sift_down(&mut self, mut idx: usize) {
+        while idx < self.data.len() {
+            let left = 2 * idx + 1;
+            let right = 2 * idx + 2;
+            let mut largest = idx;
+            if left < self.data.len() {
+                let (larg, lf) = slice_get_two(&mut self.data, largest, left);
+                if (self.comparator)(lf, larg).is_lt() {
+                    largest = left;
+                }
+            }
+            if right < self.data.len() {
+                let (larg, rt) = slice_get_two(&mut self.data, largest, right);
+                if (self.comparator)(rt, larg).is_lt() {
+                    largest = right;
+                }
+            }
+            if largest != idx {
+                self.data.swap(largest, idx);
+                idx = largest;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 /// Writes all value changes from the source file to the FST.
 /// Note this is not the most efficient way to do this!
 /// A faster version would write each signal directly to the FST instead
 /// of writing changes based on the time step.
 fn write_value_changes<R: BufRead + Seek + Send + 'static>(
+    input_range: (u64, u64),
     start: std::time::Instant,
-    timescale_exponent: i8,
     range: Option<(u64, u64)>,
     waves: Vec<(FstReader<R>, u32, u64, SignalRefMap)>,
     compare: &[(fstapi::Handle, fstapi::Handle, fstapi::Handle)],
     out: &mut Writer,
 ) {
-    // PERF: use a n-way merge sort
-    println!("{:>10.2?} Collecting time table", start.elapsed());
-    let mut time_table = waves
-        .iter()
-        .enumerate()
-        .flat_map(|(idx, (wave, factor, offset, _))| {
-            let exp = wave.get_header().timescale_exponent;
-            let offset = from_ns(*offset, exp);
-            wave.get_time_table()
-                .unwrap()
-                .iter()
-                .take_while(move |time| {
-                    if let Some((start, end)) = range {
-                        *time + offset <= from_ns(end, exp)
-                    } else {
-                        true
-                    }
-                })
-                .enumerate()
-                .map(move |(time_idx, time)| ((*time + offset) * *factor as u64, idx, time_idx))
-        })
-        .filter(|(time, _, _)| {
-            if let Some((start, end)) = range {
-                *time >= from_ns(start, timescale_exponent)
-                    && *time <= from_ns(end, timescale_exponent)
-            } else {
-                true
-            }
-        })
-        .collect::<Vec<_>>();
+    let mut signals =
+        BinaryHeap::new(|(x, _): &mut (SignalChannel, SignalRefMap), (y, _)| x.cmp(y));
 
-    println!("{:>10.2?} Sorting time table", start.elapsed());
-    time_table.sort_unstable();
-
-    let mut signals: Vec<_> = waves
-        .into_iter()
-        .map(|(wave, factor, offset, signal_ids)| {
-            (SignalChannel::new(wave, factor, offset, range), signal_ids)
-        })
-        .collect();
+    for wave in waves.into_iter().map(|(wave, factor, offset, signal_ids)| {
+        (SignalChannel::new(wave, factor, offset, range), signal_ids)
+    }) {
+        signals.insert(wave);
+    }
 
     println!("{:>10.2?} Writing value changes", start.elapsed());
 
@@ -421,7 +513,7 @@ fn write_value_changes<R: BufRead + Seek + Send + 'static>(
         .unwrap()
         .progress_chars("█▉▊▋▌▍▎▏  ");
 
-    let bar = indicatif::ProgressBar::new(time_table.len() as u64).with_style(style);
+    let bar = indicatif::ProgressBar::new(input_range.1 - input_range.0).with_style(style);
 
     bar.set_position(0);
 
@@ -433,55 +525,55 @@ fn write_value_changes<R: BufRead + Seek + Send + 'static>(
     );
 
     let mut last_time = 0;
+    let mut i = 0;
 
-    for (i, (time, wave_idx, _)) in time_table.iter().enumerate() {
-        if last_time != *time {
+    while !signals.is_empty() {
+        let (signal_iter, signal_ref_map) = signals.peek().unwrap();
+        let Some((change_time, fst_id, value)) = signal_iter.next() else {
+            signals.pop();
+            continue;
+        };
+
+        assert!(
+            change_time >= last_time,
+            "change_time: {} < last_time: {}",
+            change_time,
+            last_time,
+        );
+
+        if change_time != last_time {
+            out.emit_time_change(change_time)
+                .expect("failed time change");
             for (var, a, b) in compare {
                 let a = curr_value.get(a);
                 let b = curr_value.get(b);
                 out.emit_value_change(*var, &[(a == b) as u8 + b'0'])
                     .expect("failed to write compare");
             }
-            last_time = *time;
+            last_time = change_time;
         }
 
-        // println!("Time: {} {} {}", time_idx, time, wave_idx);
-        out.emit_time_change(*time).expect("failed time change");
+        let handle = signal_ref_map.get(&fst_id.get_index()).unwrap();
 
-        let (signal_iter, signal_ref_map) = &mut signals[*wave_idx];
-        while signal_iter
-            .peek()
-            .map(|(change_time, _, _)| {
-                assert!(
-                    change_time >= *time,
-                    "change_time: {} < time: {}",
-                    change_time,
-                    time
-                );
-                change_time == *time
-            })
-            .unwrap_or_else(|| false)
-        {
-            let (_, fst_id, value) = signal_iter.next().unwrap();
-
-            let handle = signal_ref_map.get(&fst_id.get_index()).unwrap();
-
-            if !curr_value.is_empty() {
-                curr_value
-                    .entry(*handle)
-                    .and_modify(|v| *v = value.to_vec());
-            }
-
-            out.emit_value_change(*handle, value)
-                .expect("failed to write value change");
-
-            if i % 1_000_000 == 0 {
-                bar.set_position(i as u64);
-            }
-            // if i % 10_000_000 == 0 {
-            //     out.flush();
-            // }
+        if !curr_value.is_empty() {
+            curr_value
+                .entry(*handle)
+                .and_modify(|v| *v = value.to_vec());
         }
+
+        out.emit_value_change(*handle, value)
+            .expect("failed to write value change");
+
+        // give it back to the queue
+        signals.sift_down(0);
+
+        if i % 5_000_000 == 0 {
+            bar.set_position(last_time - input_range.0);
+        }
+        // if i % 10_000_000 == 0 {
+        //     out.flush();
+        // }
+        i += 1;
     }
     bar.finish();
 }
