@@ -7,6 +7,7 @@ edition = "2021"
 clap = { version = "4.5.23", features = ["derive"] }
 fst-reader = "0.10.0"
 fstapi = "0.0.2"
+hashbrown = "0.15.2"
 indicatif = "0.17.9"
 parking_lot = { version = "0.12.3", features = ["arc_lock"] }
 

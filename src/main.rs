@@ -10,9 +10,9 @@
 use clap::Parser;
 use fst_reader::{FstReader, FstSignalHandle, FstSignalValue};
 use fstapi::Writer;
+use hashbrown::{HashMap, HashSet};
 use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
 use std::{
-    collections::{HashMap, HashSet},
     io::{BufRead, Read, Seek},
     sync::Arc,
 };
@@ -67,8 +67,11 @@ const PROGRESS_BAR_TEMPLATE: &str = "\
 {elapsed_precise} █{bar:60.cyan/blue}█ {pos:>8}/{len:>8} {per_sec} ({eta})";
 
 fn main() {
-    println!("{:?}", std::env::args().collect::<Vec<_>>());
+    let start = std::time::Instant::now();
+
     let args = Args::parse();
+
+    println!("{:>10.2?} Reading input files", start.elapsed());
 
     // let mut wave = simple::read(args.input).expect("failed to read input");
     let mut waves: Vec<FstReader<_>> = args
@@ -76,8 +79,21 @@ fn main() {
         .iter()
         .map(|path| {
             let file = std::fs::File::open(path).expect("failed to open file");
-            FstReader::open_and_read_time_table(std::io::BufReader::new(file))
-                .expect("failed to open FST")
+            let reader = FstReader::open_and_read_time_table(std::io::BufReader::new(file))
+                .expect("failed to open FST");
+
+            let header = reader.get_header();
+            let exp = header.timescale_exponent;
+
+            println!(
+                "{:>10.2?} Input file {}: interval: {:.2?} to {:.2?}",
+                start.elapsed(),
+                path.display(),
+                std::time::Duration::from_nanos(to_ns(header.start_time, exp)),
+                std::time::Duration::from_nanos(to_ns(header.end_time, exp))
+            );
+
+            reader
         })
         .collect();
 
@@ -108,7 +124,7 @@ fn main() {
         .map(|offsets| {
             offsets
                 .split(',')
-                .map(|offset| offset.parse::<u64>().expect("invalid offset"))
+                .map(|offset| parse_as_ns(offset))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_else(|| vec![0; waves.len()]);
@@ -123,8 +139,6 @@ fn main() {
     if offsets.len() != waves.len() {
         panic!("Number of offsets does not match number of input files");
     }
-    println!("Offsets: {:?}", offsets);
-    println!("Factors: {:?}", factors);
 
     let mut compares = Vec::new();
     if let Some(cmp) = args.cmp.as_ref() {
@@ -135,6 +149,7 @@ fn main() {
         }
     }
 
+    println!("{:>10.2?} Writing hierarchy", start.elapsed());
     let mut out = Writer::create(args.output, true)
         .expect("failed to open output")
         .timescale(timescale_exponent as i32);
@@ -164,9 +179,9 @@ fn main() {
         .zip(offsets)
         .map(|(((wave, signal_ref_map), factor), offset)| (wave, factor, offset, signal_ref_map))
         .collect();
-    write_value_changes(timescale_exponent, range, waves, &compares, &mut out);
+    write_value_changes(start, timescale_exponent, range, waves, &compares, &mut out);
 
-    println!("Finishing writing FST file");
+    println!("{:>10.2?} Finished writing", start.elapsed());
     // out.finish().expect("failed to finish writing the FST file");
 }
 
@@ -176,12 +191,21 @@ struct SignalChannel {
     read: usize,
 }
 
-fn from_ns(time: u64, exp: i8) -> u64 {
+fn to_ns(time: u64, exp: i8) -> u64 {
     let exp_ns = exp + 9;
     if exp_ns < 0 {
         time * 10u64.pow(-exp_ns as u32)
     } else {
-        time.div_ceil(10u64.pow(exp_ns as u32))
+        time * 10u64.pow(exp_ns as u32)
+    }
+}
+
+fn from_ns(ns: u64, exp: i8) -> u64 {
+    let exp_ns = exp + 9;
+    if exp_ns < 0 {
+        ns * 10u64.pow(-exp_ns as u32)
+    } else {
+        ns.div_ceil(10u64.pow(exp_ns as u32))
     }
 }
 
@@ -198,7 +222,6 @@ impl SignalChannel {
             let exp = reader.get_header().timescale_exponent;
             *start = from_ns(*start, exp);
             *end = from_ns(*end, exp);
-            println!("Filtering from {} to {}", start, end);
             fst_reader::FstFilter::filter_time(*start, *end)
         } else {
             fst_reader::FstFilter::all()
@@ -343,6 +366,7 @@ fn read_from_buffer<'a>(buffer: &mut &'a [u8]) -> Option<(u64, FstSignalHandle, 
 /// A faster version would write each signal directly to the FST instead
 /// of writing changes based on the time step.
 fn write_value_changes<R: BufRead + Seek + Send + 'static>(
+    start: std::time::Instant,
     timescale_exponent: i8,
     range: Option<(u64, u64)>,
     waves: Vec<(FstReader<R>, u32, u64, SignalRefMap)>,
@@ -350,15 +374,25 @@ fn write_value_changes<R: BufRead + Seek + Send + 'static>(
     out: &mut Writer,
 ) {
     // PERF: use a n-way merge sort
+    println!("{:>10.2?} Collecting time table", start.elapsed());
     let mut time_table = waves
         .iter()
         .enumerate()
         .flat_map(|(idx, (wave, factor, offset, _))| {
+            let exp = wave.get_header().timescale_exponent;
+            let offset = from_ns(*offset, exp);
             wave.get_time_table()
                 .unwrap()
                 .iter()
+                .take_while(move |time| {
+                    if let Some((start, end)) = range {
+                        *time + offset <= from_ns(end, exp)
+                    } else {
+                        true
+                    }
+                })
                 .enumerate()
-                .map(move |(time_idx, time)| (*time * *factor as u64 + offset, idx, time_idx))
+                .map(move |(time_idx, time)| ((*time + offset) * *factor as u64, idx, time_idx))
         })
         .filter(|(time, _, _)| {
             if let Some((start, end)) = range {
@@ -370,7 +404,7 @@ fn write_value_changes<R: BufRead + Seek + Send + 'static>(
         })
         .collect::<Vec<_>>();
 
-    println!("Sorting time table");
+    println!("{:>10.2?} Sorting time table", start.elapsed());
     time_table.sort_unstable();
 
     let mut signals: Vec<_> = waves
@@ -380,7 +414,7 @@ fn write_value_changes<R: BufRead + Seek + Send + 'static>(
         })
         .collect();
 
-    println!("Writing value changes");
+    println!("{:>10.2?} Writing value changes", start.elapsed());
 
     let style = indicatif::ProgressStyle::default_bar()
         .template(PROGRESS_BAR_TEMPLATE)
@@ -391,10 +425,12 @@ fn write_value_changes<R: BufRead + Seek + Send + 'static>(
 
     bar.set_position(0);
 
-    let need_to_be_compares: HashSet<fstapi::Handle> =
-        HashSet::from_iter(compare.iter().flat_map(|(_, a, b)| [*a, *b].into_iter()));
-
-    let mut curr_value = HashMap::new();
+    let mut curr_value: HashMap<fstapi::Handle, Vec<u8>> = HashMap::from_iter(
+        compare
+            .iter()
+            .flat_map(|(_, a, b)| [*a, *b].into_iter())
+            .map(|handle| (handle, vec![b'x'])),
+    );
 
     let mut last_time = 0;
 
@@ -430,8 +466,10 @@ fn write_value_changes<R: BufRead + Seek + Send + 'static>(
 
             let handle = signal_ref_map.get(&fst_id.get_index()).unwrap();
 
-            if !need_to_be_compares.is_empty() && need_to_be_compares.contains(handle) {
-                curr_value.insert(*handle, value.to_vec());
+            if !curr_value.is_empty() {
+                curr_value
+                    .entry(*handle)
+                    .and_modify(|v| *v = value.to_vec());
             }
 
             out.emit_value_change(*handle, value)
@@ -454,7 +492,6 @@ fn write_hierarchy<'a, R: BufRead + Seek + 'a>(
     hiers: impl Iterator<Item = &'a mut FstReader<R>>,
     out: &mut Writer,
 ) -> (Vec<SignalRefMap>, HashMap<String, fstapi::Handle>) {
-    println!("Writing hierarchy");
     let mut signal_ref_maps = Vec::with_capacity(hiers.size_hint().0);
 
     let mut signal_names = HashMap::new();
