@@ -12,7 +12,7 @@ use fst_reader::{FstReader, FstSignalHandle, FstSignalValue};
 use fstapi::Writer;
 use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{BufRead, Read, Seek},
     sync::Arc,
 };
@@ -21,13 +21,46 @@ use std::{
 #[command(name = "fst-merge")]
 #[command(about = "Converts a VCD, GHW or FST file to an FST file.", long_about = None)]
 struct Args {
+    /// Paths for the input .fst files that will be merged
     #[arg(value_name = "INPUTs")]
     inputs: Vec<std::path::PathBuf>,
+
+    /// The path to the output .fst file
     #[arg(short, long)]
     output: std::path::PathBuf,
 
-    #[arg(short, long)]
+    /// Comma separated list of offsets, one for each input file. Each offset will be added to the
+    /// timestamps of the respective input file. Cannot be negative.
+    #[arg(long)]
+    offsets: Option<String>,
+
+    /// Only get changes in the given range, in the format "start-end", like "0-100ms".
+    #[arg(long)]
+    range: Option<String>,
+
+    /// Create new debug signals that compare the values of two signals other signals. The format
+    /// is `name:left=right,name2:left2=right2,...`. The `name` is the name of the new signal,
+    /// which will be created under the `debug` scope. `left` and `right` are the names of the
+    /// signals to compare, in the format `input_idx.scope.signal_name`, like `0.gameroy.cpu.pc`.
+    #[arg(long)]
     cmp: Option<String>,
+}
+
+fn parse_as_ns(s: &str) -> u64 {
+    let index = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (value, unit) = s.split_at(index);
+    let value = value.parse::<u64>().expect("invalid range value");
+    match unit {
+        "fs" => value.div_ceil(1_000_000),
+        "ps" => value.div_ceil(1_000),
+        "ns" => value,
+        "us" => value * 1_000,
+        "ms" => value * 1_000_000,
+        "s" => value * 1_000_000_000,
+        "m" => value * 60_000_000_000,
+        "" => value,
+        _ => panic!("invalid range unit"),
+    }
 }
 
 const PROGRESS_BAR_TEMPLATE: &str = "\
@@ -62,6 +95,24 @@ fn main() {
 
     let timescale_exponent = timescales.clone().map(|(_, exp)| exp).min().unwrap();
 
+    let range = args.range.as_ref().map(|range| {
+        let (start, end) = range.split_once('-').expect("invalid range format");
+        let start = parse_as_ns(start);
+        let end = parse_as_ns(end);
+        (start, end)
+    });
+
+    let offsets = args
+        .offsets
+        .as_ref()
+        .map(|offsets| {
+            offsets
+                .split(',')
+                .map(|offset| offset.parse::<u64>().expect("invalid offset"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![0; waves.len()]);
+
     let factors = timescales
         .map(|(factor, exp)| {
             let exp = exp - timescale_exponent;
@@ -69,44 +120,51 @@ fn main() {
         })
         .collect::<Vec<_>>();
 
-    // let start_time = waves.iter().map(|wave| wave.time_table()[0]).min().unwrap();
-    // let version = waves
-    //     .iter()
-    //     .map(|wave| wave.hierarchy().version())
-    //     .next()
-    //     .unwrap()
-    //     .to_string();
-    // let date = waves
-    //     .iter()
-    //     .map(|wave| wave.hierarchy().date())
-    //     .next()
-    //     .unwrap()
-    //     .to_string();
+    if offsets.len() != waves.len() {
+        panic!("Number of offsets does not match number of input files");
+    }
+    println!("Offsets: {:?}", offsets);
+    println!("Factors: {:?}", factors);
 
-    // let info = FstInfo {
-    //     start_time,
-    //     timescale_exponent,
-    //     version,
-    //     date,
-    //     file_type: FstFileType::Verilog, // TODO
-    // };
-    //
-    // let mut out = open_fst(args.output, &info).expect("failed to open output");
-    // let mut out = out
-    //     .finish()
-    //     .expect("failed to write FST header or hierarchy");
+    let mut compares = Vec::new();
+    if let Some(cmp) = args.cmp.as_ref() {
+        for c in cmp.split(',') {
+            let (name, expr) = c.split_once(':').expect("invalid compare format");
+            let (left, right) = expr.split_once('=').expect("invalid compare format");
+            compares.push((name.trim(), left.trim(), right.trim()));
+        }
+    }
+
     let mut out = Writer::create(args.output, true)
         .expect("failed to open output")
         .timescale(timescale_exponent as i32);
-    let signal_ref_maps = write_hierarchy(waves.iter_mut(), &mut out);
+    let (signal_ref_maps, signal_names) = write_hierarchy(waves.iter_mut(), &mut out);
+
+    out.set_scope(fstapi::scope_type::VCD_MODULE, "debug", "")
+        .expect("failed to write top scope");
+    let compares = compares
+        .into_iter()
+        .map(|(name, left, right)| {
+            let handle = out
+                .create_var(0, 0, 1, name, None)
+                .expect("failed to create compare signal");
+            (
+                handle,
+                *signal_names.get(left).expect("invalid signal name"),
+                *signal_names.get(right).expect("invalid signal name"),
+            )
+        })
+        .collect::<Vec<_>>();
+    out.set_upscope();
 
     let waves: Vec<_> = waves
         .into_iter()
         .zip(signal_ref_maps)
         .zip(factors)
-        .map(|((wave, signal_ref_map), factor)| (wave, factor, signal_ref_map))
+        .zip(offsets)
+        .map(|(((wave, signal_ref_map), factor), offset)| (wave, factor, offset, signal_ref_map))
         .collect();
-    write_value_changes(waves, &mut out);
+    write_value_changes(timescale_exponent, range, waves, &compares, &mut out);
 
     println!("Finishing writing FST file");
     // out.finish().expect("failed to finish writing the FST file");
@@ -118,21 +176,33 @@ struct SignalChannel {
     read: usize,
 }
 
+fn from_ns(time: u64, exp: i8) -> u64 {
+    let exp_ns = exp + 9;
+    if exp_ns < 0 {
+        time * 10u64.pow(-exp_ns as u32)
+    } else {
+        time.div_ceil(10u64.pow(exp_ns as u32))
+    }
+}
+
 impl SignalChannel {
     const LEN: usize = 3;
 
-    fn new<R: BufRead + Seek + Send + 'static>(mut reader: FstReader<R>) -> Self {
-        let mut ids = Vec::new();
-
-        reader
-            .read_hierarchy(|entry| {
-                if let fst_reader::FstHierarchyEntry::Var { handle, .. } = entry {
-                    ids.push(handle)
-                }
-            })
-            .unwrap();
-
-        let filter = fst_reader::FstFilter::new(0, u64::MAX, ids);
+    fn new<R: BufRead + Seek + Send + 'static>(
+        mut reader: FstReader<R>,
+        factor: u32,
+        offset: u64,
+        mut range: Option<(u64, u64)>,
+    ) -> Self {
+        let filter = if let Some((start, end)) = range.as_mut() {
+            let exp = reader.get_header().timescale_exponent;
+            *start = from_ns(*start, exp);
+            *end = from_ns(*end, exp);
+            println!("Filtering from {} to {}", start, end);
+            fst_reader::FstFilter::filter_time(*start, *end)
+        } else {
+            fst_reader::FstFilter::all()
+        };
 
         let queue = std::array::from_fn(|_| Arc::new(Mutex::new(Vec::new())));
 
@@ -167,6 +237,12 @@ impl SignalChannel {
                             }
                             last_time = time;
 
+                            if let Some((start, end)) = range.as_ref() {
+                                if time < *start || time > *end {
+                                    return;
+                                }
+                            }
+
                             if lock.len() + value.len() > BUFFER_SIZE {
                                 // swap
                                 queue.rotate_left(1);
@@ -174,7 +250,7 @@ impl SignalChannel {
                                 debug_assert!(lock.len() == 0);
                             }
 
-                            push_to_buffer(&mut lock, time, handle, value);
+                            push_to_buffer(&mut lock, time * factor as u64 + offset, handle, value);
                         }
                         FstSignalValue::Real(_) => unimplemented!(),
                     })
@@ -231,8 +307,8 @@ impl SignalChannel {
     }
 }
 
-fn push_to_buffer(buffer: &mut Vec<u8>, time_idx: u64, handle: FstSignalHandle, value: &[u8]) {
-    buffer.extend_from_slice(&time_idx.to_ne_bytes());
+fn push_to_buffer(buffer: &mut Vec<u8>, time: u64, handle: FstSignalHandle, value: &[u8]) {
+    buffer.extend_from_slice(&time.to_ne_bytes());
     buffer.extend_from_slice(&handle.get_index().to_ne_bytes());
     buffer.extend_from_slice(&(value.len() as u16).to_ne_bytes());
     buffer.extend_from_slice(value);
@@ -244,9 +320,9 @@ fn read_from_buffer<'a>(buffer: &mut &'a [u8]) -> Option<(u64, FstSignalHandle, 
     }
     // if it is not empty, it is a logic error if the buffer is too short
 
-    let mut time_idx = [0; u64::BITS as usize / 8];
-    buffer.read_exact(&mut time_idx).unwrap();
-    let time_idx = u64::from_ne_bytes(time_idx);
+    let mut time = [0; u64::BITS as usize / 8];
+    buffer.read_exact(&mut time).unwrap();
+    let time = u64::from_ne_bytes(time);
 
     let mut handle = [0; usize::BITS as usize / 8];
     buffer.read_exact(&mut handle).unwrap();
@@ -259,7 +335,7 @@ fn read_from_buffer<'a>(buffer: &mut &'a [u8]) -> Option<(u64, FstSignalHandle, 
     let value = &buffer[..len as usize];
     *buffer = &buffer[len as usize..];
 
-    Some((time_idx, handle, value))
+    Some((time, handle, value))
 }
 
 /// Writes all value changes from the source file to the FST.
@@ -267,27 +343,41 @@ fn read_from_buffer<'a>(buffer: &mut &'a [u8]) -> Option<(u64, FstSignalHandle, 
 /// A faster version would write each signal directly to the FST instead
 /// of writing changes based on the time step.
 fn write_value_changes<R: BufRead + Seek + Send + 'static>(
-    waves: Vec<(FstReader<R>, u32, SignalRefMap)>,
+    timescale_exponent: i8,
+    range: Option<(u64, u64)>,
+    waves: Vec<(FstReader<R>, u32, u64, SignalRefMap)>,
+    compare: &[(fstapi::Handle, fstapi::Handle, fstapi::Handle)],
     out: &mut Writer,
 ) {
     // PERF: use a n-way merge sort
-    println!("Sorting time table");
     let mut time_table = waves
         .iter()
         .enumerate()
-        .flat_map(|(idx, (wave, factor, _))| {
+        .flat_map(|(idx, (wave, factor, offset, _))| {
             wave.get_time_table()
                 .unwrap()
                 .iter()
                 .enumerate()
-                .map(move |(time_idx, time)| (*time * *factor as u64, idx, time_idx))
+                .map(move |(time_idx, time)| (*time * *factor as u64 + offset, idx, time_idx))
+        })
+        .filter(|(time, _, _)| {
+            if let Some((start, end)) = range {
+                *time >= from_ns(start, timescale_exponent)
+                    && *time <= from_ns(end, timescale_exponent)
+            } else {
+                true
+            }
         })
         .collect::<Vec<_>>();
+
+    println!("Sorting time table");
     time_table.sort_unstable();
 
     let mut signals: Vec<_> = waves
         .into_iter()
-        .map(|(wave, _, signal_ids)| (SignalChannel::new(wave), signal_ids))
+        .map(|(wave, factor, offset, signal_ids)| {
+            (SignalChannel::new(wave, factor, offset, range), signal_ids)
+        })
         .collect();
 
     println!("Writing value changes");
@@ -301,7 +391,24 @@ fn write_value_changes<R: BufRead + Seek + Send + 'static>(
 
     bar.set_position(0);
 
-    for (i, (time, wave_idx, time_idx)) in time_table.iter().enumerate() {
+    let need_to_be_compares: HashSet<fstapi::Handle> =
+        HashSet::from_iter(compare.iter().flat_map(|(_, a, b)| [*a, *b].into_iter()));
+
+    let mut curr_value = HashMap::new();
+
+    let mut last_time = 0;
+
+    for (i, (time, wave_idx, _)) in time_table.iter().enumerate() {
+        if last_time != *time {
+            for (var, a, b) in compare {
+                let a = curr_value.get(a);
+                let b = curr_value.get(b);
+                out.emit_value_change(*var, &[(a == b) as u8 + b'0'])
+                    .expect("failed to write compare");
+            }
+            last_time = *time;
+        }
+
         // println!("Time: {} {} {}", time_idx, time, wave_idx);
         out.emit_time_change(*time).expect("failed time change");
 
@@ -311,7 +418,7 @@ fn write_value_changes<R: BufRead + Seek + Send + 'static>(
             .map(|(change_time, _, _)| {
                 assert!(
                     change_time >= *time,
-                    "change_idx: {} < time: {}",
+                    "change_time: {} < time: {}",
                     change_time,
                     time
                 );
@@ -321,7 +428,13 @@ fn write_value_changes<R: BufRead + Seek + Send + 'static>(
         {
             let (_, fst_id, value) = signal_iter.next().unwrap();
 
-            out.emit_value_change(*signal_ref_map.get(&fst_id.get_index()).unwrap(), value)
+            let handle = signal_ref_map.get(&fst_id.get_index()).unwrap();
+
+            if !need_to_be_compares.is_empty() && need_to_be_compares.contains(handle) {
+                curr_value.insert(*handle, value.to_vec());
+            }
+
+            out.emit_value_change(*handle, value)
                 .expect("failed to write value change");
 
             if i % 1_000_000 == 0 {
@@ -340,21 +453,35 @@ type SignalRefMap = std::collections::HashMap<usize, fstapi::Handle>;
 fn write_hierarchy<'a, R: BufRead + Seek + 'a>(
     hiers: impl Iterator<Item = &'a mut FstReader<R>>,
     out: &mut Writer,
-) -> Vec<SignalRefMap> {
+) -> (Vec<SignalRefMap>, HashMap<String, fstapi::Handle>) {
     println!("Writing hierarchy");
     let mut signal_ref_maps = Vec::with_capacity(hiers.size_hint().0);
+
+    let mut signal_names = HashMap::new();
+
     for (i, hier) in hiers.enumerate() {
         out.set_scope(fstapi::scope_type::VCD_MODULE, &i.to_string(), "")
             .expect("failed to write top scope");
         let mut signal_ref_map = SignalRefMap::new();
+
+        let mut curr_scope: String = String::new();
+        let mut scope_path: String = i.to_string();
 
         hier.read_hierarchy(|entry| match entry {
             fst_reader::FstHierarchyEntry::Scope {
                 tpe,
                 name,
                 component,
-            } => out.set_scope(tpe as u32, &name, &component).unwrap(),
-            fst_reader::FstHierarchyEntry::UpScope => out.set_upscope(),
+            } => {
+                curr_scope = name.clone();
+                scope_path += ".";
+                scope_path += name.as_str();
+                out.set_scope(tpe as u32, &name, &component).unwrap()
+            }
+            fst_reader::FstHierarchyEntry::UpScope => {
+                scope_path.drain(scope_path.len() - curr_scope.len() - 1..);
+                out.set_upscope()
+            }
             fst_reader::FstHierarchyEntry::Var {
                 tpe,
                 direction,
@@ -367,6 +494,10 @@ fn write_hierarchy<'a, R: BufRead + Seek + 'a>(
                 let handle2 = out
                     .create_var(tpe as u32, direction as u32, length, &name, alias)
                     .unwrap();
+
+                let name_path = scope_path.clone() + "." + name.as_str();
+                signal_names.insert(name_path, handle2);
+
                 if alias.is_none() {
                     signal_ref_map.insert(handle.get_index(), handle2);
                 }
@@ -378,7 +509,8 @@ fn write_hierarchy<'a, R: BufRead + Seek + 'a>(
         signal_ref_maps.push(signal_ref_map);
         out.set_upscope();
     }
-    signal_ref_maps
+
+    (signal_ref_maps, signal_names)
 }
 
 /// Lowest common multiple
