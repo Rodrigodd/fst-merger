@@ -7,7 +7,8 @@ visualizer, like GTKWave or Surfer.
 
 ## Example
 
-![2024-02-29_22h29m15s_screenshot](https://github.com/Rodrigodd/vcd-merger/assets/51273772/1e21c935-eca1-42e0-ba80-709f416410ad)
+![Surfer viewing output file](https://github.com/user-attachments/assets/d26c2449-7eea-445c-b230-b22a339f0ade)
+
 
 In the example two traces ("gameroy" and "SM83_Run") where combined in a single
 file for easier visualization. Also aditional signals where added for comparing
